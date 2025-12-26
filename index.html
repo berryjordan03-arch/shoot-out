@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>SHOOT OUT!</title>
+<style>
+  html,body{margin:0;height:100%;background:#0c0e11;overflow:hidden;}
+  canvas{display:block;margin:0 auto;image-rendering:pixelated;touch-action:manipulation;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<script>
+/*
+SHOOT OUT! — single-screen reaction duel (HTML5 Canvas)
+- No tutorials / no “READY” / no meters / no hint UI
+- One input: tap/click/space/enter
+- Silent randomized delay -> single cue -> one shot decides outcome
+- Silent difficulty scaling + rotating cue modes (incl. audio-only)
+- Pixel-perfect scaling, 60fps target, deterministic seed option
+- Best score saved; shown only on death
+
+URL params (optional):
+  ?seed=12345            // deterministic RNG
+  &sound=0|1             // default 1
+  &hardcore=0|1          // default 0 (hardcore forces audio-only cue)
+  &cue=rotate|text|bell|glyph|none   // default rotate (none = audio-only if sound on)
+  &fs=0|1                // request fullscreen on first input (default 1)
+*/
+
+(() => {
+  // -----------------------------
+  // Config
+  // -----------------------------
+  const BASE_W = 640, BASE_H = 360;        // internal resolution
+  const GROUND_Y = Math.floor(BASE_H * 0.66);
+  const LEFT_X = 176;
+  const RIGHT_X = 464;
+
+  const params = new URLSearchParams(location.search);
+  const SEED = params.has("seed") ? (Number(params.get("seed"))|0) : null;
+  const SOUND_ON = params.get("sound") !== "0";
+  const FULLSCREEN_ON = params.get("fs") !== "0";
+  const HARDCORE = params.get("hardcore") === "1";
+  const cueParam = (params.get("cue") || "rotate").toLowerCase();
+
+  // -----------------------------
+  // Deterministic RNG (optional)
+  // -----------------------------
+  function mulberry32(a){
+    return function(){
+      let t = a += 0x6D2B79F5;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rng = SEED !== null ? mulberry32(SEED || 1) : Math.random;
+  const r01 = () => rng();
+  const rRange = (a,b) => a + (b-a)*r01();
+  const rPick = (arr) => arr[(r01()*arr.length)|0];
+
+  // -----------------------------
+  // Canvas & pixel-perfect scaling
+  // -----------------------------
+  const canvas = document.getElementById("cv");
+  const ctx = canvas.getContext("2d", { alpha:false });
+
+  function resize(){
+    const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+    const sx = window.innerWidth / BASE_W;
+    const sy = window.innerHeight / BASE_H;
+    const scale = Math.max(1, Math.floor(Math.min(sx, sy) * 10) / 10); // stable sizing
+    canvas.style.width = Math.floor(BASE_W * scale) + "px";
+    canvas.style.height = Math.floor(BASE_H * scale) + "px";
+    canvas.width = Math.floor(BASE_W * scale * dpr);
+    canvas.height = Math.floor(BASE_H * scale * dpr);
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+  }
+  window.addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // -----------------------------
+  // Audio (sparse, meaningful)
+  // -----------------------------
+  let audioCtx = null;
+  function ensureAudio(){
+    if (!SOUND_ON) return;
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  function tone(freq, ms, type="triangle", gain=0.02){
+    if (!SOUND_ON || !audioCtx) return;
+    const t0 = audioCtx.currentTime;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + ms/1000);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t0);
+    o.stop(t0 + ms/1000 + 0.02);
+  }
+  const sBell = () => { tone(880, 70, "triangle", 0.02); setTimeout(()=>tone(1320, 70, "triangle", 0.015), 35); };
+  const sClick = () => { tone(1800, 25, "square", 0.01); };
+  const sThud = () => { tone(90, 70, "sawtooth", 0.02); };
+
+  // -----------------------------
+  // Game state
+  // -----------------------------
+  const State = Object.freeze({
+    WAIT: "wait",       // silent delay
+    CUE: "cue",         // cue window open
+    DEAD: "dead",       // score reveal
+    PAUSE: "pause",     // debug-only pause via Esc (no UI beyond word)
+  });
+
+  let state = State.WAIT;
+  let pausedFrom = State.WAIT;
+
+  let streak = 0;
+  let score = 0;
+  let best = Number(localStorage.getItem("shootout_best") || 0);
+
+  let waitUntil = 0;
+  let cueOpenedAt = 0;
+
+  // per duel flags
+  let playerShot = false;
+  let enemyShot = false;
+  let early = false;
+  let late = false;
+  let timeoutLoss = false;
+
+  // cue mode rotation
+  const cueModes = ["text","bell","glyph","none"]; // none = audio-only if sound on
+  let cueMode = cueParam === "rotate" ? "rotate" : cueParam;
+  if (!cueModes.includes(cueMode) && cueMode !== "rotate") cueMode = "rotate";
+
+  // -----------------------------
+  // Difficulty (silent)
+  // -----------------------------
+  function tier(){ return streak; }
+
+  function reactionWindowMs(t){
+    // Tightens to a hard floor
+    return Math.max(85, 220 - t * 10);
+  }
+
+  // Enemy reaction time distribution: faster as tier rises, slight archetype variation
+  const Opponents = [
+    { name:"Drifter", speedBias:  0, jitter:70, coat:"#1b1e24", hat:"#2b2f36" },
+    { name:"Deputy",  speedBias: -8, jitter:60, coat:"#20252d", hat:"#171a1f" },
+    { name:"Gambler", speedBias:-14, jitter:55, coat:"#2a2028", hat:"#19151a" },
+    { name:"Outlaw",  speedBias:-22, jitter:45, coat:"#20202a", hat:"#0f1115" },
+    { name:"Legend",  speedBias:-30, jitter:35, coat:"#15181e", hat:"#0b0c0f" },
+  ];
+  function pickOpponent(t){
+    const idx = Math.min(Opponents.length-1, Math.floor(t / 3));
+    // occasional step-up for variety
+    const bump = (r01() < 0.25 && idx+1 < Opponents.length) ? idx+1 : idx;
+    return Opponents[bump];
+  }
+  let opponent = pickOpponent(0);
+
+  function enemyBaseReactionMs(t, opp){
+    return Math.max(32, 170 - t * 12 + opp.speedBias);
+  }
+
+  function waitDelayMs(t){
+    // Less predictable, slightly shorter floor over time
+    const min = Math.max(320, 820 - t * 18);
+    const max = Math.max(min + 250, 2300 - t * 32);
+    return rRange(min, max);
+  }
+
+  // -----------------------------
+  // World: subtle wind + dust
+  // -----------------------------
+  let wind = 0;
+  const dust = [];
+  function spawnDust(){
+    if (dust.length > 80) dust.splice(0, 12);
+    dust.push({
+      x: rRange(0, BASE_W),
+      y: rRange(GROUND_Y, BASE_H),
+      vx: rRange(10, 22),
+      vy: rRange(-2, 3),
+      life: 1.0,
+      r: (rRange(1,3)|0)
+    });
+  }
+
+  // -----------------------------
+  // Core round control
+  // -----------------------------
+  function resetDuelFlags(){
+    playerShot = enemyShot = false;
+    early = late = timeoutLoss = false;
+  }
+
+  function chooseCueMode(){
+    if (HARDCORE) return "none";
+    if (cueMode === "rotate") {
+      // Weighted: mostly text/glyph/bell; sometimes none
+      const roll = r01();
+      if (roll < 0.48) return "text";
+      if (roll < 0.72) return "glyph";
+      if (roll < 0.92) return "bell";
+      return "none";
+    }
+    return cueMode;
+  }
+  let activeCueMode = chooseCueMode();
+
+  function beginRound(){
+    resetDuelFlags();
+    opponent = pickOpponent(tier());
+    activeCueMode = chooseCueMode();
+
+    state = State.WAIT;
+    waitUntil = performance.now() + waitDelayMs(tier());
+    cueOpenedAt = 0;
+  }
+
+  function openCue(){
+    state = State.CUE;
+    cueOpenedAt = performance.now();
+
+    // cue sound is allowed but must not telegraph *before* cue
+    if (SOUND_ON) { ensureAudio(); sBell(); }
+
+    const t = tier();
+    const winMs = reactionWindowMs(t);
+
+    // Schedule enemy reaction
+    const base = enemyBaseReactionMs(t, opponent);
+    const enemyDelay = base + rRange(0, opponent.jitter);
+
+    setTimeout(() => {
+      if (state !== State.CUE) return;
+      if (!playerShot) {
+        enemyShot = true;
+        late = true;
+        resolveDuel();
+      }
+    }, enemyDelay);
+
+    // Cue window timeout
+    setTimeout(() => {
+      if (state !== State.CUE) return;
+      if (!playerShot && !enemyShot) {
+        timeoutLoss = true;
+        resolveDuel();
+      }
+    }, winMs);
+  }
+
+  function resolveDuel(){
+    // Determine win: shot during cue and before enemy, and not early
+    const win = playerShot && !early && !late && !timeoutLoss && !enemyShot;
+
+    if (win) {
+      streak++;
+      score++;
+      if (SOUND_ON) sClick();
+      setTimeout(beginRound, 680);
+      state = State.WAIT; // will be overwritten by beginRound after delay
+    } else {
+      if (SOUND_ON) sThud();
+      best = Math.max(best, score);
+      localStorage.setItem("shootout_best", String(best));
+      state = State.DEAD;
+    }
+  }
+
+  // -----------------------------
+  // Input: one action
+  // -----------------------------
+  let fsAttempted = false;
+  function tryFullscreen(){
+    if (!FULLSCREEN_ON || fsAttempted) return;
+    fsAttempted = true;
+    const el = document.documentElement;
+    if (el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+  }
+
+  function fire(){
+    ensureAudio();
+    tryFullscreen();
+
+    if (state === State.DEAD) {
+      // frictionless restart (no explanation)
+      streak = 0;
+      score = 0;
+      beginRound();
+      return;
+    }
+    if (state === State.PAUSE) return;
+
+    if (state === State.WAIT) {
+      // early shot => instant loss
+      playerShot = true;
+      early = true;
+      resolveDuel();
+      return;
+    }
+    if (state === State.CUE) {
+      if (playerShot) return;
+      playerShot = true;
+      // if enemy already shot (race), you lose
+      if (enemyShot) {
+        late = true;
+      }
+      resolveDuel();
+    }
+  }
+
+  // Touch/mouse/keyboard
+  window.addEventListener("mousedown", fire, { passive:true });
+  window.addEventListener("touchstart", (e) => { e.preventDefault(); fire(); }, { passive:false });
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Escape") { // pause is non-design UI; only for testing
+      if (state === State.PAUSE) state = pausedFrom;
+      else { pausedFrom = state; state = State.PAUSE; }
+      return;
+    }
+    if (e.code === "Space" || e.code === "Enter") fire();
+  });
+
+  // -----------------------------
+  // Rendering (pixel silhouettes, restraint)
+  // -----------------------------
+  function drawBackground(t){
+    // warm sky gradient
+    const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    g.addColorStop(0, "#f4b15a");
+    g.addColorStop(0.55, "#d37c34");
+    g.addColorStop(1, "#a64a24");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, BASE_W, GROUND_Y);
+
+    // ground
+    ctx.fillStyle = "#6f351f";
+    ctx.fillRect(0, GROUND_Y, BASE_W, BASE_H - GROUND_Y);
+    ctx.fillStyle = "rgba(255,255,255,0.05)";
+    ctx.fillRect(0, GROUND_Y, BASE_W, 6);
+
+    // depth: wooden buildings (two rows, subtle parallax)
+    wind = Math.sin(t * 0.00035) * 6;
+    drawBuildingRow(GROUND_Y - 70, 0.18, wind * 0.25);
+    drawBuildingRow(GROUND_Y - 50, 0.26, wind * 0.45);
+
+    // distant haze band
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(0, GROUND_Y - 95, BASE_W, 26);
+  }
+
+  function drawBuildingRow(yBase, alpha, xShift){
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(xShift, 0);
+
+    const building = "#241b16";
+    const trim = "#3a2a22";
+
+    // deterministic-ish pattern per frame would shimmer if RNG used;
+    // instead use fixed pseudo layout based on x stepping
+    let x = -60;
+    let i = 0;
+    while (x < BASE_W + 80){
+      const w = 52 + ((i * 17) % 38);
+      const h = 28 + ((i * 23) % 44);
+      const y = yBase - h;
+
+      ctx.fillStyle = building;
+      ctx.fillRect(x, y, w, h);
+
+      ctx.fillStyle = trim;
+      ctx.fillRect(x, y + 6, w, 2);
+
+      // sparse window glow (fixed, not random)
+      if ((i % 3) === 0){
+        ctx.fillStyle = "rgba(255,220,160,0.22)";
+        ctx.fillRect(x + 10, y + 12, 6, 6);
+      }
+      x += w + 14;
+      i++;
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDust(dt){
+    // update
+    for (let i = dust.length - 1; i >= 0; i--){
+      const p = dust[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= 0.35 * dt;
+      if (p.life <= 0 || p.x > BASE_W + 10) dust.splice(i, 1);
+    }
+    // spawn occasionally (subtle)
+    if (r01() < 0.08) spawnDust();
+
+    // render
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    for (const p of dust){
+      ctx.globalAlpha = 0.18 * Math.max(0, p.life);
+      ctx.fillRect(p.x|0, p.y|0, p.r, p.r);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCowboy(x, y, facingRight, style, shot, hit, t, depthScale){
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(facingRight ? 1 : -1, 1);
+    ctx.scale(depthScale, depthScale);
+
+    // micro idle animation (only while waiting/cue)
+    const idle = (state === State.WAIT || state === State.CUE) ? 1 : 0;
+    const breathe = idle * Math.sin(t * 0.006) * 1;
+    const hatSway = idle * Math.sin(t * 0.004) * 1;
+    const finger = idle && state === State.WAIT ? (Math.sin(t * 0.01) > 0.995 ? 1 : 0) : 0;
+
+    // body (silhouette first)
+    ctx.fillStyle = style.coat;
+    ctx.fillRect(-10, 0 + breathe, 20, 28);
+
+    // head
+    ctx.fillStyle = "#d6bf9b";
+    ctx.fillRect(-8, -16 + breathe, 16, 16);
+
+    // hat
+    ctx.fillStyle = style.hat;
+    ctx.fillRect(-13, -22 + breathe + hatSway, 26, 6);
+    ctx.fillRect(-6, -28 + breathe + hatSway, 12, 6);
+
+    // legs
+    ctx.fillStyle = "#12161d";
+    ctx.fillRect(-10, 28 + breathe, 8, 8);
+    ctx.fillRect(2, 28 + breathe, 8, 8);
+
+    // arm & gun
+    if (!shot){
+      // hand near holster
+      ctx.fillStyle = "#12161d";
+      ctx.fillRect(8, 14 + breathe + finger, 7, 4);
+      ctx.fillStyle = "#2b1a12";
+      ctx.fillRect(6, 18 + breathe, 6, 6);
+    } else {
+      // extended arm (instant action feel)
+      ctx.fillStyle = "#12161d";
+      ctx.fillRect(6, 12 + breathe, 12, 4);
+      ctx.fillStyle = "#bfc6cf";
+      ctx.fillRect(18, 11 + breathe, 6, 3);
+
+      // muzzle spark (brief, not spectacle)
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillRect(25, 10 + breathe, 2, 2);
+      ctx.fillStyle = "rgba(255,210,120,0.75)";
+      ctx.fillRect(27, 10 + breathe, 2, 2);
+    }
+
+    // hit feedback: hat pop shimmer (bloodless)
+    if (hit){
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fillRect(-12, -32 + breathe, 24, 4);
+    }
+
+    ctx.restore();
+  }
+
+  function drawCue(){
+    if (activeCueMode === "none") return; // audio-only if sound on
+
+    ctx.save();
+    ctx.globalAlpha = 0.95;
+    ctx.textAlign = "center";
+
+    if (activeCueMode === "text"){
+      // high contrast, instantaneous
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 56px monospace";
+      ctx.fillText("DRAW", BASE_W/2, BASE_H/2 - 8);
+    } else if (activeCueMode === "bell"){
+      const x = (BASE_W/2)|0, y = (BASE_H/2 - 28)|0;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(x-16, y, 32, 24);
+      ctx.fillRect(x-10, y-10, 20, 10);
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillRect(x-2, y+18, 4, 4);
+    } else if (activeCueMode === "glyph"){
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(BASE_W/2 - 3, BASE_H/2 - 44, 6, 80);
+      ctx.fillRect(BASE_W/2 - 34, BASE_H/2 - 2, 68, 6);
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDeath(){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
+    ctx.fillRect(0,0,BASE_W,BASE_H);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.font = "bold 34px monospace";
+    ctx.fillText("DEAD", BASE_W/2, BASE_H/2 - 44);
+
+    ctx.font = "18px monospace";
+    ctx.fillText(`Score: ${score}`, BASE_W/2, BASE_H/2 - 2);
+    ctx.fillText(`Best:  ${best}`,  BASE_W/2, BASE_H/2 + 24);
+
+    // Minimal restart affordance (allowed on death; not instructional during play)
+    ctx.font = "14px monospace";
+    ctx.fillText(" ", BASE_W/2, BASE_H/2 + 60); // intentionally blank (no onboarding text)
+    ctx.restore();
+  }
+
+  function drawPause(){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0,0,BASE_W,BASE_H);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "bold 28px monospace";
+    ctx.fillText("PAUSED", BASE_W/2, BASE_H/2);
+    ctx.restore();
+  }
+
+  // -----------------------------
+  // Main loop
+  // -----------------------------
+  let lastT = performance.now();
+  function loop(t){
+    const dtMs = Math.min(50, t - lastT);
+    const dt = dtMs / 1000;
+    lastT = t;
+
+    // state transitions
+    if (state === State.WAIT && t >= waitUntil){
+      openCue();
+    }
+
+    // render
+    ctx.clearRect(0,0,BASE_W,BASE_H);
+    drawBackground(t);
+    if (state !== State.PAUSE) drawDust(dt);
+
+    // Duel layout with subtle “over-the-shoulder depth suggestion”
+    // Foreground (player) slightly larger; background (enemy) slightly smaller.
+    const playerScale = 1.06;
+    const enemyScale  = 0.98;
+
+    const playerY = GROUND_Y - 46;
+    const enemyY  = GROUND_Y - 44;
+
+    const playerHit = (state === State.DEAD) && (late || timeoutLoss) ? true : (enemyShot && !playerShot);
+    const enemyHit  = (playerShot && !early && !late && !timeoutLoss && !enemyShot) ? true : false;
+
+    // Player style fixed; opponent varies silently
+    const playerStyle = { coat:"#1d2128", hat:"#111318" };
+
+    drawCowboy(LEFT_X + wind*0.08,  playerY, true,  playerStyle, playerShot, playerHit, t, playerScale);
+    drawCowboy(RIGHT_X + wind*0.08, enemyY,  false, opponent,    enemyShot,  enemyHit,  t+777, enemyScale);
+
+    if (state === State.CUE) drawCue();
+    if (state === State.DEAD) drawDeath();
+    if (state === State.PAUSE) drawPause();
+
+    requestAnimationFrame(loop);
+  }
+
+  // -----------------------------
+  // Start
+  // -----------------------------
+  beginRound();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
